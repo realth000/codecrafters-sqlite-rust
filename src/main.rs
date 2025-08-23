@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Ok, Result};
 use bytes::Buf;
+use regex::Regex;
 use std::fs::File;
 use std::io::{prelude::*, Cursor, SeekFrom};
 
@@ -202,7 +203,8 @@ impl TableSchema {
         };
 
         let sql = String::from_utf8(data[4].clone())
-            .with_context(|| format!("invalid sql bytes: {:?}", data[4]))?;
+            .with_context(|| format!("invalid sql bytes: {:?}", data[4]))?
+            .replace(['\n', '\t'], "");
 
         Ok(Self {
             table_type,
@@ -275,6 +277,16 @@ impl SchemaTable {
         }
         table_names
     }
+
+    pub fn get_table(&self, table_name: &str) -> Result<&TableSchema> {
+        let table = self
+            .cells
+            .iter()
+            .find(|x| x.table_name == table_name)
+            .with_context(|| format!("table {table_name} not found"))?;
+
+        Ok(table)
+    }
 }
 
 /// Table data in database.
@@ -331,6 +343,26 @@ impl Table {
             cells_offsets,
             cells,
         })
+    }
+
+    /// Get all data in one column specified by column id.
+    ///
+    /// Note that the data in column is converted to String.
+    pub fn get_column(&self, col_idx: usize) -> Result<Vec<String>> {
+        if self.cells.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let codec = self.cells[0].headers[col_idx]
+            .codec()
+            .context("failed to check codec")?;
+
+        let data = self
+            .cells
+            .iter()
+            .map(|cell| codec.decode_to_string(&cell.payload[col_idx]).unwrap())
+            .collect::<Vec<_>>();
+        Ok(data)
     }
 }
 
@@ -529,6 +561,16 @@ impl VarintCodec {
             }
         }
     }
+
+    /// Decode the data to string.
+    fn decode_to_string(&self, data: &[u8]) -> Result<String> {
+        match self {
+            Self::S0 => Ok("null".into()),
+            Self::S12Even => Ok(format!("{:?}", data)),
+            Self::S13Odd => String::from_utf8(data.to_vec()).context("invalid S13Odd data"),
+            v => unimplemented!("unsupported codec {v:?}"),
+        }
+    }
 }
 
 /// A varint stores a single value effciently.
@@ -625,6 +667,31 @@ impl Varint {
     }
 }
 
+fn parse_sql_colomn_names(sql: &str) -> Result<Vec<String>> {
+    if !sql.starts_with("CREATE TABLE") {
+        bail!("unsupported sql statement")
+    }
+
+    let p1 = sql.find('(').context("'(' not found in sql")?;
+    let p2 = sql.find(')').context("')' not found in sql")?;
+
+    let rows = sql[p1 + 1..p2]
+        .split(",")
+        .map(|x| x.split_once(" ").unwrap().0.to_string())
+        .collect();
+    Ok(rows)
+}
+
+fn load_schema_from_file(file_path: &str) -> Result<SchemaTable> {
+    let mut file = File::open(file_path)?;
+    let mut file_bytes = vec![];
+    file.read_to_end(&mut file_bytes)?;
+    let mut cursor = Cursor::new(file_bytes.as_slice());
+    let schema_table =
+        SchemaTable::from_cursor(&mut cursor).context("failed to parse schema table")?;
+    Ok(schema_table)
+}
+
 fn load_table_from_file(file_path: &str, table_name: &str) -> Result<Table> {
     let mut file = File::open(file_path)?;
     let mut file_bytes = vec![];
@@ -664,6 +731,10 @@ fn main() -> Result<()> {
     // Parse command and act accordingly
     let file_path = &args[1];
     let command = &args[2];
+
+    let select_column_re =
+        Regex::new(r#"(SELECT|select) (?<column>\w+) (FROM|from) (?<table>\w+)$"#).unwrap();
+
     match command.as_str() {
         ".dbinfo" => {
             let mut file = File::open(file_path)?;
@@ -700,11 +771,40 @@ fn main() -> Result<()> {
                 println!("{}", table.cells.len());
 
                 return Ok(());
-            } else if v.starts_with("__print ") {
+            } else if select_column_re.is_match(v) {
+                let cap = select_column_re.captures(v).unwrap();
+                let column_name = cap.name("column").unwrap().as_str();
+                let table_name = cap.name("table").unwrap().as_str();
+
+                let table = load_table_from_file(&file_path, table_name)?;
+                let schema = load_schema_from_file(&file_path)?;
+                let table_schema = schema.get_table(table_name)?;
+                let column_idx = parse_sql_colomn_names(table_schema.sql.as_str())?
+                    .iter()
+                    .position(|x| x == column_name)
+                    .with_context(|| {
+                        format!(
+                            "column \"{}\"not found in schema {}",
+                            column_name, table_schema.sql
+                        )
+                    })?;
+                let column_data = table.get_column(column_idx)?;
+                println!("{}", column_data.join("\n"));
+                return Ok(());
+            }
+
+            // Testing
+            if v.starts_with("__print ") {
                 // Command for testing: print all data in table.
                 // Count rows in table.
                 let table_name = v.split_at(8).1;
                 let table = load_table_from_file(&file_path, table_name)?;
+                let schema = load_schema_from_file(&file_path)?;
+                let table_schema = schema.get_table(table_name)?;
+                println!(
+                    "columns: {:?}",
+                    parse_sql_colomn_names(table_schema.sql.as_str()).unwrap()
+                );
                 for record in table.cells.iter() {
                     let id_type = &record.headers[0].codec().context("invalid id type")?;
                     let id = &record.payload[0];
@@ -712,11 +812,10 @@ fn main() -> Result<()> {
                     let name = String::from_utf8(record.payload[1].clone()).unwrap();
                     let color_type = &record.headers[2].codec().context("invalid color type")?;
                     let color = String::from_utf8(record.payload[2].clone()).unwrap();
-                    println!(">>> id={id:?}({id_type:?}), name={name}({name_type:?}), color={color}({color_type:?})");
+                    println!("id={id:?}({id_type:?}), name={name}({name_type:?}), color={color}({color_type:?})");
                 }
                 return Ok(());
             }
-
             bail!("Missing or invalid command passed: {}", command)
         }
     }

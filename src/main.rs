@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Ok, Result};
 use bytes::Buf;
 use std::fs::File;
-use std::io::{prelude::*, Cursor};
+use std::io::{prelude::*, Cursor, SeekFrom};
 
 /// The 100 bytes database header at the begining of database file.
 /// Also and only parts of the first table - The schema table.
@@ -12,26 +12,42 @@ pub struct DatabaseHeader {
     /// The database page size in bytes.
     /// Must be a power of two between 512 and 32768 inclusive, or the value 1 representing a page size of 65536.
     page_size: u16,
+
+    /// Offset=20, size=1
+    ///
+    /// The size of reserved region in each B-tree page, usually 20.
+    reserved_region_size: u8,
 }
 
 impl DatabaseHeader {
     pub fn from_cursor(cursor: &mut Cursor<&'_ [u8]>) -> Result<Self> {
-        cursor
-            .read(&mut [0u8; 16])
-            .context("failed to read pre-offset bytes")?;
+        if cursor.position() != 0 {
+            bail!("failed to read database header: expected 0 offset on cursor")
+        }
 
+        cursor
+            .seek_relative(16)
+            .context("page_size position not found")?;
         let page_size = cursor.get_u16();
 
         cursor
-            .read_exact(&mut [0u8; 100 - 16 - 2])
-            .context("failed to read post-offset bytes")?;
+            .seek_relative(3)
+            .context("reserved_region_size not found")?;
+        let reserved_region_size = cursor.get_u8();
 
-        Ok(Self { page_size })
+        cursor
+            .seek(SeekFrom::Start(100))
+            .context("failed to complete db header")?;
+
+        Ok(Self {
+            page_size,
+            reserved_region_size,
+        })
     }
 }
 
 /// Type of B-tree page.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[repr(u8)]
 enum BTreePageType {
     InteriorIndex = 0x02,
@@ -57,7 +73,7 @@ impl TryFrom<u8> for BTreePageType {
 /// The first 8 or 12 bytes in B-tree page.
 ///
 /// See `B-tree Page Header Format` table on https://www.sqlite.org/fileformat2.html
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct BTreePageHeader {
     /// Offset=0, size=1
     page_type: BTreePageType,
@@ -122,7 +138,7 @@ impl TryFrom<&[u8]> for TableType {
 ///
 /// This struct is only used in schema table to descibe all tables in the database.
 #[derive(Debug, Clone)]
-pub struct Table {
+pub struct TableSchema {
     /// Table type.
     ///
     /// In this challenge, all tables are `TableType::Table`.
@@ -146,7 +162,7 @@ pub struct Table {
     pub sql: String,
 }
 
-impl Table {
+impl TableSchema {
     /// Build from bytes of data.
     ///
     /// The data are grouped in `Vec<u8>` in the fields' order, that is:
@@ -210,7 +226,9 @@ pub struct SchemaTable {
     cells_offsets: Vec<u16>,
 
     /// Table data.
-    cells: Vec<Table>,
+    ///
+    /// Offset of nth table is saved as the nth element in `cells_offsets`.
+    cells: Vec<TableSchema>,
 }
 
 impl SchemaTable {
@@ -237,8 +255,8 @@ impl SchemaTable {
                     record.headers.len()
                 )
             }
-            let table_def =
-                Table::from_bytes(&record.payload).context("failed to build table definition")?;
+            let table_def = TableSchema::from_bytes(&record.payload)
+                .context("failed to build table definition")?;
             cells.push(table_def);
         }
 
@@ -259,9 +277,68 @@ impl SchemaTable {
     }
 }
 
+/// Table data in database.
+///
+/// This type is NOT the schema of table in `SchemaTable`.
+/// For the definition of table, see `SchemaTable`.
+///
+/// Compared to the `SchemaTable`, `Table` does not have database header, all other fields are the same.
+///
+/// Table can be stored in a single page or multiple pages, till not we assume small enough to store in
+/// a single page.
+#[derive(Debug, Clone)]
+pub struct Table {
+    /// Page header.
+    page_header: BTreePageHeader,
+
+    /// All cells offset.
+    cells_offsets: Vec<u16>,
+
+    /// Table data.
+    ///
+    /// Offset of nth table is saved as the nth element in `cells_offsets`.
+    cells: Vec<Record>,
+}
+
+impl Table {
+    pub fn from_cursor(cursor: &mut Cursor<&'_ [u8]>) -> Result<Self> {
+        let table_start_pos = cursor.position();
+        let page_header =
+            BTreePageHeader::from_cursor(cursor).context("failed to parse page_header")?;
+
+        let mut cells_offsets = vec![];
+        let cells_count = page_header.cells_count;
+        for _ in 0..cells_count {
+            cells_offsets.push(cursor.get_u16());
+        }
+        // Should NOT sort cells here, because the order of elements in cells_offset array is the same with
+        // items in table, that is, the nth element in cells_offset locates the nth row in table, sorting
+        // cells_offsets array loses the row order in table. Though cells data are not saved in the same order,
+        // it's fine because we are relocating the cursor with the obsolute position.
+        // cells_offsets.sort();
+
+        let mut cells = vec![];
+        for pos in cells_offsets.iter() {
+            let cell_pos = table_start_pos + (*pos as u64);
+            cursor.set_position(cell_pos);
+            // Parse record, the schema of schema table info.
+            let record = Record::from_cursor(cursor).context("failed to parse page cell")?;
+            cells.push(record);
+        }
+
+        Ok(Self {
+            page_header,
+            cells_offsets,
+            cells,
+        })
+    }
+}
+
 /// Record in cell, carryig data.
 ///
 /// Record contains header and payload where header is `varint`s and payload is `Vec<u8>`s.
+///
+/// Each record holds a row of data in the table, stores in `payload` field.
 ///
 /// ```console
 /// // Size of the record (varint): 120
@@ -294,7 +371,7 @@ impl SchemaTable {
 /// 6f 72 61 6e 67 65 73  // Value of sqlite_schema.tbl_name: "oranges"  <---
 /// ...
 /// ```
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Record {
     /// Cell length, totally.
     ///
@@ -308,9 +385,17 @@ pub struct Record {
     header_bytes_count: Varint,
 
     /// Headers.
+    ///
+    /// Headers describes how many payload it have and where these payloads are.
+    /// Always have a same length as `payload`.
     headers: Vec<Varint>,
 
     /// Payload.
+    ///
+    /// Always have a same length as `headers`.
+    ///
+    /// Each payload in holds one column data in one row, that is, all payload in
+    /// the same record forms an entire row of the table.
     payload: Vec<Vec<u8>>,
 }
 
@@ -353,7 +438,7 @@ impl Record {
 
         let mut payload = vec![];
         for header in headers.iter() {
-            let mut buf = vec![0u8; header.decoded_value as usize];
+            let mut buf = vec![0u8; header.decoded()? as usize];
             cursor
                 .read_exact(&mut buf)
                 .with_context(|| format!("when fill header size {}", buf.len()))?;
@@ -379,7 +464,7 @@ impl Record {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum VarintCodec {
     /// Value is a NULL.
     S0,
@@ -422,24 +507,24 @@ pub enum VarintCodec {
 }
 
 impl VarintCodec {
-    fn produce(serial_type: u32) -> (Self, u32) {
+    fn produce(serial_type: u32) -> Result<(Self, u32)> {
         match serial_type {
-            0 => (Self::S0, 0),
-            1 => (Self::S1, 1),
-            2 => (Self::S2, 2),
-            3 => (Self::S3, 3),
-            4 => (Self::S4, 4),
-            5 => (Self::S5, 6),
-            6 => (Self::S6, 8),
-            7 => (Self::S7, 8),
-            8 => (Self::S8, 0),
-            9 => (Self::S9, 0),
-            10 | 11 => unreachable!("table contains reserved record format codec {serial_type}"),
+            0 => Ok((Self::S0, 0)),
+            1 => Ok((Self::S1, 1)),
+            2 => Ok((Self::S2, 2)),
+            3 => Ok((Self::S3, 3)),
+            4 => Ok((Self::S4, 4)),
+            5 => Ok((Self::S5, 6)),
+            6 => Ok((Self::S6, 8)),
+            7 => Ok((Self::S7, 8)),
+            8 => Ok((Self::S8, 0)),
+            9 => Ok((Self::S9, 0)),
+            10 | 11 => bail!("table contains reserved record format codec {serial_type}"),
             v => {
                 if v % 2 == 0 {
-                    (Self::S12Even, (v - 12) / 2)
+                    Ok((Self::S12Even, (v - 12) / 2))
                 } else {
-                    (Self::S13Odd, (v - 13) / 2)
+                    Ok((Self::S13Odd, (v - 13) / 2))
                 }
             }
         }
@@ -453,16 +538,10 @@ impl VarintCodec {
 ///   * In this usage, decoded value is the column type.
 /// * If the varint stores data not related to column (e.g. size of record, row id), the encoded
 ///   value is the value we want.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Varint {
-    /// Codec of the varint.
-    codec: VarintCodec,
-
     /// The cauculated value before decoding.
     encoded_value: u32,
-
-    /// The decoded value, indicating the size of corresponding data.
-    decoded_value: u32,
 
     /// Count of consumed bytes.
     consumed_bytes_count: u32,
@@ -517,16 +596,60 @@ impl Varint {
             .map(|(idx, x)| x * 2u32.pow(idx as u32))
             .fold(0, |acc, x| acc + x);
 
-        let (codec, decoded_value) = VarintCodec::produce(encoded_value);
-
         Ok(Self {
-            codec,
             encoded_value,
-            decoded_value,
             consumed_bytes_count,
             offsets: (offset_begin, offset_end),
         })
     }
+
+    /// Get the decoded value of current varint.
+    ///
+    /// As not all usage of varint are using the decoded value, only ones recoding data
+    /// in table (or say "in the payload of record") are using decoded value (say it "SerialType"),
+    /// we no longer decode or store the value in varint when constructing a varint instance, instead
+    /// only decode it when needed.
+    pub fn decoded(&self) -> Result<u32> {
+        let (_codec, decoded_value) =
+            VarintCodec::produce(self.encoded_value).context("invalid varint value")?;
+        Ok(decoded_value)
+    }
+
+    /// Get the codec of current varint.
+    ///
+    /// See `decoded` for details.
+    pub fn codec(&self) -> Result<VarintCodec> {
+        let (codec, _) =
+            VarintCodec::produce(self.encoded_value).context("invalid varint value")?;
+        Ok(codec)
+    }
+}
+
+fn load_table_from_file(file_path: &str, table_name: &str) -> Result<Table> {
+    let mut file = File::open(file_path)?;
+    let mut file_bytes = vec![];
+    file.read_to_end(&mut file_bytes)?;
+    let mut cursor = Cursor::new(file_bytes.as_slice());
+    let schema_table =
+        SchemaTable::from_cursor(&mut cursor).context("failed to parse schema table")?;
+    // Command for testing: print all data in table.
+    // Count rows in table.
+    let target_table = schema_table
+        .cells
+        .iter()
+        .find(|x| x.table_name == table_name)
+        .with_context(|| format!("table {table_name} not found"))?;
+    let page_size = schema_table.db_header.page_size as u32;
+    let offset = (target_table.root_page - 1) * page_size;
+    let mut cursor = Cursor::new(file_bytes.as_slice());
+    cursor
+        .seek_relative(offset as i64)
+        .context("failed to find table postion")?;
+
+    let table = Table::from_cursor(&mut cursor)
+        .with_context(|| format!("failed to parse table {}", table_name))?;
+
+    Ok(table)
 }
 
 fn main() -> Result<()> {
@@ -539,10 +662,11 @@ fn main() -> Result<()> {
     }
 
     // Parse command and act accordingly
+    let file_path = &args[1];
     let command = &args[2];
     match command.as_str() {
         ".dbinfo" => {
-            let mut file = File::open(&args[1])?;
+            let mut file = File::open(file_path)?;
             let mut file_bytes = vec![];
             file.read_to_end(&mut file_bytes)?;
             let mut cursor = Cursor::new(file_bytes.as_slice());
@@ -552,7 +676,7 @@ fn main() -> Result<()> {
             println!("number of tables: {}", schema_table.page_header.cells_count);
         }
         ".tables" => {
-            let mut file = File::open(&args[1])?;
+            let mut file = File::open(file_path)?;
             let mut file_bytes = vec![];
             file.read_to_end(&mut file_bytes)?;
             let mut cursor = Cursor::new(file_bytes.as_slice());
@@ -568,7 +692,33 @@ fn main() -> Result<()> {
             let table_names = table_names.join(" ");
             println!("{}", table_names);
         }
-        _ => bail!("Missing or invalid command passed: {}", command),
+        v => {
+            if v.starts_with("select count(*) from ") {
+                // Count rows in table.
+                let table_name = v.split_at(21).1;
+                let table = load_table_from_file(&file_path, table_name)?;
+                println!("{}", table.cells.len());
+
+                return Ok(());
+            } else if v.starts_with("__print ") {
+                // Command for testing: print all data in table.
+                // Count rows in table.
+                let table_name = v.split_at(8).1;
+                let table = load_table_from_file(&file_path, table_name)?;
+                for record in table.cells.iter() {
+                    let id_type = &record.headers[0].codec().context("invalid id type")?;
+                    let id = &record.payload[0];
+                    let name_type = &record.headers[1].codec().context("invalid name type")?;
+                    let name = String::from_utf8(record.payload[1].clone()).unwrap();
+                    let color_type = &record.headers[2].codec().context("invalid color type")?;
+                    let color = String::from_utf8(record.payload[2].clone()).unwrap();
+                    println!(">>> id={id:?}({id_type:?}), name={name}({name_type:?}), color={color}({color_type:?})");
+                }
+                return Ok(());
+            }
+
+            bail!("Missing or invalid command passed: {}", command)
+        }
     }
 
     Ok(())

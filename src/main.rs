@@ -96,6 +96,108 @@ impl BTreePageHeader {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum TableType {
+    Table,
+    Index,
+    View,
+    Trigger,
+}
+
+impl TryFrom<&[u8]> for TableType {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &[u8]) -> std::result::Result<Self, Self::Error> {
+        match value {
+            b"table" => Ok(Self::Table),
+            b"index" => Ok(Self::Index),
+            b"view" => Ok(Self::View),
+            b"trigger" => Ok(Self::Trigger),
+            v => bail!("unknown table type bytes {v:?}"),
+        }
+    }
+}
+
+/// Describe tables.
+///
+/// This struct is only used in schema table to descibe all tables in the database.
+#[derive(Debug, Clone)]
+pub struct Table {
+    /// Table type.
+    ///
+    /// In this challenge, all tables are `TableType::Table`.
+    pub table_type: TableType,
+
+    /// Name of current table.
+    pub name: String,
+
+    /// Name of the related table.
+    ///
+    /// * For index, triggers and views, this field is the name of table which is working on.
+    /// * For normal tables, this field is the same as `name`, simply the table name.
+    pub table_name: String,
+
+    /// The page number of the root B-tree page for tables and indexes.
+    ///
+    /// For views, triggers, and virtual tables, the rootpage column is 0 or NULL.
+    pub root_page: u32,
+
+    /// SQL text that describes the object.
+    pub sql: String,
+}
+
+impl Table {
+    /// Build from bytes of data.
+    ///
+    /// The data are grouped in `Vec<u8>` in the fields' order, that is:
+    ///
+    /// * `data[0]` stores `table_type`.
+    /// * `data[1]` stores `name`.
+    /// * `data[2]` stores `table_name`.
+    /// * `data[3]` stores `root_page`.
+    /// * `data[4]` stores `sql`.
+    fn from_bytes(data: &Vec<Vec<u8>>) -> Result<Self> {
+        if data.len() != 5 {
+            bail!(
+                "incorrect table description data column size: {}",
+                data.len()
+            )
+        }
+
+        let table_type = TableType::try_from(data[0].as_slice()).context("invalid table type")?;
+        let name = String::from_utf8(data[1].clone())
+            .with_context(|| format!("invalid name bytes: {:?}", data[1]))?;
+
+        let table_name = String::from_utf8(data[2].clone())
+            .with_context(|| format!("invalid table name bytes: {:?}", data[2]))?;
+
+        if data[3].len() > 4 {
+            bail!("too many bytes for root page number: {}", data[3].len())
+        }
+
+        let root_page = {
+            let mut buf = [0u8; 4];
+            let mut j = 3;
+            for i in (0..data[3].len()).rev() {
+                buf[j] = data[3][i].clone();
+                j -= 1;
+            }
+            u32::from_be_bytes(buf)
+        };
+
+        let sql = String::from_utf8(data[4].clone())
+            .with_context(|| format!("invalid sql bytes: {:?}", data[4]))?;
+
+        Ok(Self {
+            table_type,
+            name,
+            table_name,
+            root_page,
+            sql,
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct SchemaTable {
     /// Database header.
@@ -108,7 +210,7 @@ pub struct SchemaTable {
     cells_offsets: Vec<u16>,
 
     /// Table data.
-    cells: Vec<Record>,
+    cells: Vec<Table>,
 }
 
 impl SchemaTable {
@@ -124,8 +226,6 @@ impl SchemaTable {
         }
         cells_offsets.sort();
 
-        println!(">>> cells count: {}", cells_count);
-
         let mut cells = vec![];
         for pos in cells_offsets.iter() {
             cursor.set_position(*pos as u64);
@@ -137,7 +237,9 @@ impl SchemaTable {
                     record.headers.len()
                 )
             }
-            cells.push(record);
+            let table_def =
+                Table::from_bytes(&record.payload).context("failed to build table definition")?;
+            cells.push(table_def);
         }
 
         Ok(Self {
@@ -148,10 +250,10 @@ impl SchemaTable {
         })
     }
 
-    pub fn table_names(&self) -> Vec<String> {
+    pub fn table_names(&self) -> Vec<&str> {
         let mut table_names = vec![];
-        for cell in self.cells.iter() {
-            table_names.push(String::from_utf8(cell.payload[2].clone()).unwrap());
+        for table in self.cells.iter() {
+            table_names.push(table.table_name.as_str());
         }
         table_names
     }
@@ -218,34 +320,29 @@ impl Record {
             panic!("cursor ended");
         }
 
-        println!(
-            ">>> pos={}, build record, bytes remaining: {}",
-            cursor.position(),
-            cursor.remaining()
-        );
-        let pos_before = cursor.position();
-
-        let length = Varint::from_cursor(cursor).context("failed to parse length")?;
-        println!(">>> Record, pos after length: {}", cursor.position());
+        // Sum of bytes the header of record consumes.
+        let record_bytes_count = Varint::from_cursor(cursor).context("failed to parse length")?;
         let row_id = Varint::from_cursor(cursor).context("failed to parse row id")?;
-        println!(">>> Record, pos after row_id: {}", cursor.position());
 
+        /* Parsing record header */
+
+        let pos_before = cursor.position();
         let header_bytes_count =
             Varint::from_cursor(cursor).context("failed to parse record header length")?;
-        println!(
-            ">>> length={length:?}, row_id={row_id:?}, header_bytes_count={header_bytes_count:?}",
-        );
-        let header_length = header_bytes_count.decoded_value - 1;
+
+        // Sum of bytes all column info consumes.
+        // Value includes header_bytes_count ifself so the remaining bytes for columns to consume is one byte less.
+        let column_bytes_count = header_bytes_count.encoded_value - 1;
 
         let mut headers = vec![];
         let mut consumed_bytes_count = 0;
         loop {
-            if consumed_bytes_count == header_length {
+            if consumed_bytes_count == column_bytes_count {
                 break;
-            } else if consumed_bytes_count > header_length {
+            } else if consumed_bytes_count > column_bytes_count {
                 panic!(
                     "consumed more bytes than expected: expected {}, actually {}",
-                    header_length, consumed_bytes_count
+                    column_bytes_count, consumed_bytes_count
                 );
             }
             let header =
@@ -257,21 +354,23 @@ impl Record {
         let mut payload = vec![];
         for header in headers.iter() {
             let mut buf = vec![0u8; header.decoded_value as usize];
-            cursor.read_exact(&mut buf)?;
+            cursor
+                .read_exact(&mut buf)
+                .with_context(|| format!("when fill header size {}", buf.len()))?;
             payload.push(buf);
         }
 
         let pos_after = cursor.position();
-        if (pos_after - pos_before) as u32 != length.decoded_value {
+        if (pos_after - pos_before) as u32 != record_bytes_count.encoded_value {
             bail!(
-                "parsed cell length not match, expeced {}, got {}",
-                length.decoded_value,
+                "parsed record length not match, expeced {}, got {}",
+                record_bytes_count.encoded_value,
                 pos_after - pos_before
             )
         }
 
         Ok(Self {
-            length,
+            length: record_bytes_count,
             row_id,
             header_bytes_count,
             headers,
@@ -347,6 +446,13 @@ impl VarintCodec {
     }
 }
 
+/// A varint stores a single value effciently.
+///
+/// * If the varint stores column related data, it also represents the column type in `VarintCodec`.
+///   * For column type, see comments in `VarintCodec`.
+///   * In this usage, decoded value is the column type.
+/// * If the varint stores data not related to column (e.g. size of record, row id), the encoded
+///   value is the value we want.
 #[derive(Debug)]
 pub struct Varint {
     /// Codec of the varint.
@@ -360,6 +466,9 @@ pub struct Varint {
 
     /// Count of consumed bytes.
     consumed_bytes_count: u32,
+
+    /// Byte offsets.
+    offsets: (u64, u64),
 }
 
 impl Varint {
@@ -378,9 +487,9 @@ impl Varint {
         // 3. Concat bytes with highest bit set to 0: `0000001 <concat> 1000111` -> `11000111` -> `199.`
         let mut raw_bits = vec![];
         let mut consumed_bytes_count = 0;
+        let offset_begin = cursor.position();
         loop {
             let curr_byte = cursor.get_u8();
-            println!(">>> curr_byte={:x} {}", curr_byte, cursor.position());
             let is_last_byte = if (curr_byte & 0b10000000u8) == 0 {
                 true
             } else {
@@ -388,13 +497,19 @@ impl Varint {
             };
             consumed_bytes_count += 1;
             // TODO: Should drop the first bit of last byte?
-            for bit in format!("{:b}", curr_byte).chars().skip(1).map(|x| x as u32) {
+            for bit in format!("{:0>8b}", curr_byte)
+                .chars()
+                .skip(1)
+                .map(|x| x as u32 - 48)
+            {
                 raw_bits.push(bit);
             }
             if is_last_byte {
                 break;
             }
         }
+        let offset_end = cursor.position();
+
         let encoded_value = raw_bits
             .into_iter()
             .rev()
@@ -409,6 +524,7 @@ impl Varint {
             encoded_value,
             decoded_value,
             consumed_bytes_count,
+            offsets: (offset_begin, offset_end),
         })
     }
 }
@@ -434,6 +550,23 @@ fn main() -> Result<()> {
                 SchemaTable::from_cursor(&mut cursor).context("failed to parse schema table")?;
             println!("database page size: {}", schema_table.db_header.page_size);
             println!("number of tables: {}", schema_table.page_header.cells_count);
+        }
+        ".tables" => {
+            let mut file = File::open(&args[1])?;
+            let mut file_bytes = vec![];
+            file.read_to_end(&mut file_bytes)?;
+            let mut cursor = Cursor::new(file_bytes.as_slice());
+            let schema_table =
+                SchemaTable::from_cursor(&mut cursor).context("failed to parse schema table")?;
+            let mut table_names = schema_table
+                .table_names()
+                .iter()
+                .filter(|x| x != &&"sqlite_sequence")
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>();
+            table_names.sort();
+            let table_names = table_names.join(" ");
+            println!("{}", table_names);
         }
         _ => bail!("Missing or invalid command passed: {}", command),
     }

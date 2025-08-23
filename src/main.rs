@@ -348,20 +348,39 @@ impl Table {
     /// Get all data in one column specified by column id.
     ///
     /// Note that the data in column is converted to String.
-    pub fn get_column(&self, col_idx: usize) -> Result<Vec<String>> {
+    pub fn get_columns(&self, cols: &[&ColumnInfo]) -> Result<Vec<String>> {
         if self.cells.is_empty() {
             return Ok(vec![]);
         }
 
-        let codec = self.cells[0].headers[col_idx]
-            .codec()
-            .context("failed to check codec")?;
+        fn from_number(data: &[u8]) -> String {
+            let mut level = 0;
+            let mut acc: u64 = 0;
+            for i in data.iter().rev() {
+                acc += (i.to_owned() as u64) * 2_u64.pow(level);
+                level += 1;
+            }
+            format!("{acc}")
+        }
 
-        let data = self
-            .cells
-            .iter()
-            .map(|cell| codec.decode_to_string(&cell.payload[col_idx]).unwrap())
-            .collect::<Vec<_>>();
+        fn from_text(data: &[u8]) -> String {
+            String::from_utf8(data.to_owned()).unwrap()
+        }
+
+        let mut data = vec![];
+
+        for cell in self.cells.iter() {
+            let mut row_result = vec![];
+            for col in cols {
+                let d = match col.ty {
+                    ColumnType::Integer => from_number(&cell.payload[col.idx]),
+                    ColumnType::Text => from_text(&cell.payload[col.idx]),
+                };
+                row_result.push(d);
+            }
+            data.push(row_result.join("|"));
+        }
+
         Ok(data)
     }
 }
@@ -667,7 +686,32 @@ impl Varint {
     }
 }
 
-fn parse_sql_colomn_names(sql: &str) -> Result<Vec<String>> {
+#[derive(Debug, Clone)]
+pub struct ColumnInfo {
+    pub name: String,
+    pub idx: usize,
+    pub ty: ColumnType,
+}
+
+#[derive(Debug, Clone)]
+enum ColumnType {
+    Integer,
+    Text,
+}
+
+impl<'a> TryFrom<&'a str> for ColumnType {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &'a str) -> std::result::Result<Self, Self::Error> {
+        match value {
+            "integer" => Ok(Self::Integer),
+            "text" => Ok(Self::Text),
+            v => bail!("unsupport column type {v}"),
+        }
+    }
+}
+
+fn parse_sql_colomn_names(sql: &str) -> Result<Vec<ColumnInfo>> {
     if !sql.starts_with("CREATE TABLE") {
         bail!("unsupported sql statement")
     }
@@ -677,7 +721,13 @@ fn parse_sql_colomn_names(sql: &str) -> Result<Vec<String>> {
 
     let rows = sql[p1 + 1..p2]
         .split(",")
-        .map(|x| x.split_once(" ").unwrap().0.to_string())
+        .enumerate()
+        .map(|(idx, x)| {
+            let mut it = x.trim().split(" ").take(2);
+            let name = it.next().unwrap().to_string();
+            let ty = ColumnType::try_from(it.next().unwrap()).unwrap();
+            ColumnInfo { name, idx, ty }
+        })
         .collect();
     Ok(rows)
 }
@@ -733,7 +783,7 @@ fn main() -> Result<()> {
     let command = &args[2];
 
     let select_column_re =
-        Regex::new(r#"(SELECT|select) (?<column>\w+) (FROM|from) (?<table>\w+)$"#).unwrap();
+        Regex::new(r#"(SELECT|select) (?<columns>[\w ,]+) (FROM|from) (?<table>\w+)$"#).unwrap();
 
     match command.as_str() {
         ".dbinfo" => {
@@ -773,23 +823,35 @@ fn main() -> Result<()> {
                 return Ok(());
             } else if select_column_re.is_match(v) {
                 let cap = select_column_re.captures(v).unwrap();
-                let column_name = cap.name("column").unwrap().as_str();
+                let column_names = cap
+                    .name("columns")
+                    .unwrap()
+                    .as_str()
+                    .split(",")
+                    .map(|x| x.trim().to_string())
+                    .collect::<Vec<_>>();
                 let table_name = cap.name("table").unwrap().as_str();
 
                 let table = load_table_from_file(&file_path, table_name)?;
                 let schema = load_schema_from_file(&file_path)?;
                 let table_schema = schema.get_table(table_name)?;
-                let column_idx = parse_sql_colomn_names(table_schema.sql.as_str())?
-                    .iter()
-                    .position(|x| x == column_name)
-                    .with_context(|| {
-                        format!(
-                            "column \"{}\"not found in schema {}",
-                            column_name, table_schema.sql
-                        )
-                    })?;
-                let column_data = table.get_column(column_idx)?;
-                println!("{}", column_data.join("\n"));
+                let sql_columns = parse_sql_colomn_names(table_schema.sql.as_str())?;
+                let mut column_idx = vec![];
+                for column_name in column_names.iter() {
+                    let col_info = sql_columns
+                        .iter()
+                        .find(|x| x.name.as_str() == column_name)
+                        .with_context(|| {
+                            format!(
+                                "column \"{}\"not found in schema {}",
+                                column_name, table_schema.sql
+                            )
+                        })?;
+
+                    column_idx.push(col_info);
+                }
+                let column_datas = table.get_columns(column_idx.as_slice())?;
+                println!("{}", column_datas.join("\n"));
                 return Ok(());
             }
 

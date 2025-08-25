@@ -113,7 +113,7 @@ impl BTreePageHeader {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TableType {
     Table,
     Index,
@@ -283,7 +283,7 @@ impl SchemaTable {
         let table = self
             .cells
             .iter()
-            .find(|x| x.table_name == table_name)
+            .find(|x| x.table_type == TableType::Table && x.table_name == table_name)
             .with_context(|| format!("table {table_name} not found"))?;
 
         Ok(table)
@@ -314,6 +314,8 @@ impl BTreePage {
 pub enum Cells {
     TableLeaf(Vec<TableLeafRecord>),
     TableInterior(Vec<TableInteriorRecord>),
+    IndexLeaf(Vec<IndexLeafRecord>),
+    IndexInterior(Vec<IndexInteriorRecord>),
 }
 
 impl Cells {
@@ -325,15 +327,49 @@ impl Cells {
         page_header: &BTreePageHeader,
         initial_pos: u64,
     ) -> Result<Self> {
+        let mut cells_offsets = vec![];
+        let cells_count = page_header.cells_count;
+        for _ in 0..cells_count {
+            cells_offsets.push(cursor.get_u16());
+        }
         match page_header.page_type {
-            BTreePageType::InteriorIndex => todo!(),
-            BTreePageType::InteriorTable => {
-                let mut cells_offsets = vec![];
-                let cells_count = page_header.cells_count;
-                for _ in 0..cells_count {
-                    cells_offsets.push(cursor.get_u16());
+            BTreePageType::InteriorIndex => {
+                println!(">>> interior index offset=0x{:0>8x}", cursor.position());
+                let mut cells = vec![];
+                for pos in cells_offsets.iter() {
+                    let cell_pos = initial_pos + (*pos as u64);
+                    cursor.set_position(cell_pos);
+                    // Parse record, the schema of schema table info.
+                    let record = IndexInteriorRecord::from_cursor(cursor).with_context(|| {
+                        format!("failed to build index interior record at 0x{cell_pos:0>8x}")
+                    })?;
+                    cells.push(record);
+                }
+                println!(">>> interior index cells: count={}", cells.len());
+                for cell in cells.iter() {
+                    println!(">>>   left_child_offset=0x{:0>8x}", cell.left_child_offset);
+                    println!(">>>   length={}", cell.length.encoded_value);
+                    println!(
+                        ">>>   header_bytes_count={}",
+                        cell.header_bytes_count.encoded_value
+                    );
+                    for (idx, header) in cell.headers.iter().enumerate() {
+                        println!(
+                            ">>>     row_id={}, header: {}({:?})",
+                            cell.row_id.encoded_value,
+                            header
+                                .codec()
+                                .unwrap()
+                                .decode_to_string(&cell.payload[idx])
+                                .unwrap(),
+                            header.codec()
+                        );
+                    }
                 }
 
+                Ok(Self::IndexInterior(cells))
+            }
+            BTreePageType::InteriorTable => {
                 let mut cells = vec![];
                 for pos in cells_offsets.iter() {
                     let cell_pos = initial_pos + (*pos as u64);
@@ -344,22 +380,26 @@ impl Cells {
                     })?;
                     cells.push(record);
                 }
+                println!(">>> interior table cells: {cells:?}");
 
                 Ok(Self::TableInterior(cells))
             }
-            BTreePageType::LeafIndex => todo!(),
-            BTreePageType::LeafTable => {
-                let mut cells_offsets = vec![];
-                let cells_count = page_header.cells_count;
-                for _ in 0..cells_count {
-                    cells_offsets.push(cursor.get_u16());
+            BTreePageType::LeafIndex => {
+                println!(">>> leaf index offset={}", cursor.position());
+                let mut cells = vec![];
+                for pos in cells_offsets.iter() {
+                    let cell_pos = initial_pos + (*pos as u64);
+                    cursor.set_position(cell_pos);
+                    // Parse record, the schema of schema table info.
+                    let record = IndexLeafRecord::from_cursor(cursor).with_context(|| {
+                        format!("failed to build index leaf record at 0x{cell_pos:0>8x}")
+                    })?;
+                    cells.push(record);
                 }
-                // Should NOT sort cells here, because the order of elements in cells_offset array is the same with
-                // items in table, that is, the nth element in cells_offset locates the nth row in table, sorting
-                // cells_offsets array loses the row order in table. Though cells data are not saved in the same order,
-                // it's fine because we are relocating the cursor with the obsolute position.
-                // cells_offsets.sort();
 
+                Ok(Self::IndexLeaf(cells))
+            }
+            BTreePageType::LeafTable => {
                 let mut cells = vec![];
                 for pos in cells_offsets.iter() {
                     let cell_pos = initial_pos + (*pos as u64);
@@ -429,6 +469,7 @@ impl Table {
                     }
                     Ok(records)
                 }
+                _ => Ok(vec![]),
             }
         }
 
@@ -628,7 +669,7 @@ impl TableLeafRecord {
         let pos_after = cursor.position();
         if (pos_after - pos_before) as u32 != record_bytes_count.encoded_value {
             bail!(
-                "parsed record length not match, expeced {}, got {}",
+                "parsed table leaf record length not match, expeced {}, got {}",
                 record_bytes_count.encoded_value,
                 pos_after - pos_before
             )
@@ -671,6 +712,204 @@ impl TableInteriorRecord {
             .context("failed to build row_id of table interior record")?;
 
         Ok(Self { next_page, row_id })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexLeafRecord {
+    /// Cell length, totally.
+    ///
+    /// The value represents bytes count of current `Cell`, including `length` field itself.
+    length: Varint,
+
+    /// Size of the record header.
+    header_bytes_count: Varint,
+
+    /// Headers.
+    ///
+    /// Headers describes how many payload it have and where these payloads are.
+    /// Always have a same length as `payload`.
+    headers: Vec<Varint>,
+
+    /// Payload.
+    ///
+    /// Always have a same length as `headers`.
+    ///
+    /// Each payload in holds one column data in one row, that is, all payload in
+    /// the same record forms an entire row of the table.
+    payload: Vec<Vec<u8>>,
+
+    /// Row id placed after payload
+    ///
+    /// This is also part of `payload` but not "keys"
+    row_id: Varint,
+}
+
+impl IndexLeafRecord {
+    pub fn from_cursor(cursor: &mut Cursor<&'_ [u8]>) -> Result<Self> {
+        if !cursor.has_remaining() {
+            panic!("cursor ended");
+        }
+
+        // Sum of bytes the header of record consumes.
+        let record_bytes_count = Varint::from_cursor(cursor).context("failed to parse length")?;
+
+        /* Parsing record header */
+
+        let pos_before = cursor.position();
+        let header_bytes_count =
+            Varint::from_cursor(cursor).context("failed to parse record header length")?;
+
+        // Sum of bytes all column info consumes.
+        // Value includes header_bytes_count ifself so the remaining bytes for columns to consume is one byte less.
+        let column_bytes_count = header_bytes_count.encoded_value - 1;
+
+        let mut headers = vec![];
+        let mut consumed_bytes_count = 0;
+        loop {
+            if consumed_bytes_count == column_bytes_count {
+                break;
+            } else if consumed_bytes_count > column_bytes_count {
+                panic!(
+                    "consumed more bytes than expected: expected {}, actually {}",
+                    column_bytes_count, consumed_bytes_count
+                );
+            }
+            let header =
+                Varint::from_cursor(cursor).with_context(|| format!("failed to parse header"))?;
+            consumed_bytes_count += header.consumed_bytes_count;
+            headers.push(header);
+        }
+
+        let mut payload = vec![];
+        for header in headers.iter() {
+            let mut buf = vec![0u8; header.decoded()? as usize];
+            cursor
+                .read_exact(&mut buf)
+                .with_context(|| format!("when fill header size {}", buf.len()))?;
+            payload.push(buf);
+        }
+        let row_id = Varint::from_cursor(cursor)
+            .context("failed to parse row_id varint in index leaf page")?;
+
+        let pos_after = cursor.position();
+        if (pos_after - pos_before) as u32 != record_bytes_count.encoded_value {
+            bail!(
+                "parsed index leaf record length not match, expeced {}, got {}",
+                record_bytes_count.encoded_value,
+                pos_after - pos_before
+            )
+        }
+
+        Ok(Self {
+            length: record_bytes_count,
+            header_bytes_count,
+            headers,
+            payload,
+            row_id,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexInteriorRecord {
+    /// Offset of the left most child.
+    left_child_offset: u32,
+
+    /// Cell length, totally.
+    ///
+    /// The value represents bytes count of current `Cell`, including `length` field itself.
+    length: Varint,
+
+    /// Size of the record header.
+    header_bytes_count: Varint,
+
+    /// Headers.
+    ///
+    /// Headers describes how many payload it have and where these payloads are.
+    /// Always have a same length as `payload`.
+    headers: Vec<Varint>,
+
+    /// Payload.
+    ///
+    /// Always have a same length as `headers`.
+    ///
+    /// Each payload in holds one column data in one row, that is, all payload in
+    /// the same record forms an entire row of the table.
+    payload: Vec<Vec<u8>>,
+
+    /// Row id placed after payload
+    ///
+    /// This is also part of `payload` but not "keys"
+    row_id: Varint,
+}
+
+impl IndexInteriorRecord {
+    fn from_cursor(cursor: &mut Cursor<&'_ [u8]>) -> Result<Self> {
+        if !cursor.has_remaining() {
+            panic!("cursor ended");
+        }
+
+        let left_child_offset = cursor.get_u32();
+
+        // Sum of bytes the header of record consumes.
+        let record_bytes_count = Varint::from_cursor(cursor).context("failed to parse length")?;
+
+        /* Parsing record header */
+
+        let pos_before = cursor.position();
+        let header_bytes_count =
+            Varint::from_cursor(cursor).context("failed to parse record header length")?;
+
+        // Sum of bytes all column info consumes.
+        // Value includes header_bytes_count ifself so the remaining bytes for columns to consume is one byte less.
+        let column_bytes_count = header_bytes_count.encoded_value - 1;
+
+        let mut headers = vec![];
+        let mut consumed_bytes_count = 0;
+        loop {
+            if consumed_bytes_count == column_bytes_count {
+                break;
+            } else if consumed_bytes_count > column_bytes_count {
+                panic!(
+                    "consumed more bytes than expected: expected {}, actually {}",
+                    column_bytes_count, consumed_bytes_count
+                );
+            }
+            let header =
+                Varint::from_cursor(cursor).with_context(|| format!("failed to parse header"))?;
+            consumed_bytes_count += header.consumed_bytes_count;
+            headers.push(header);
+        }
+
+        let mut payload = vec![];
+        for header in headers.iter() {
+            let mut buf = vec![0u8; header.decoded()? as usize];
+            cursor
+                .read_exact(&mut buf)
+                .with_context(|| format!("when fill header size {}", buf.len()))?;
+            payload.push(buf);
+        }
+        let row_id = Varint::from_cursor(cursor)
+            .context("failed to parse row_id varint in index leaf page")?;
+
+        let pos_after = cursor.position();
+        if (pos_after - pos_before) as u32 != record_bytes_count.encoded_value + 1 {
+            bail!(
+                "parsed index interior record length not match, expeced {}, got {}",
+                record_bytes_count.encoded_value,
+                pos_after - pos_before
+            )
+        }
+
+        Ok(Self {
+            left_child_offset,
+            length: record_bytes_count,
+            header_bytes_count,
+            headers,
+            payload,
+            row_id,
+        })
     }
 }
 
@@ -746,6 +985,20 @@ impl VarintCodec {
             Self::S0 => Ok("null".into()),
             Self::S12Even => Ok(format!("{:?}", data)),
             Self::S13Odd => String::from_utf8(data.to_vec()).context("invalid S13Odd data"),
+            Self::S1 => Ok(format!("{}", u8::from_be_bytes([data[0]]))),
+            Self::S2 => Ok(format!("{}", u16::from_be_bytes([data[0], data[1]]))),
+            Self::S3 => Ok(format!(
+                "{}",
+                u32::from_be_bytes([0, data[0], data[1], data[2]])
+            )),
+            Self::S4 => Ok(format!(
+                "{}",
+                u32::from_be_bytes([data[0], data[1], data[2], data[3]])
+            )),
+            Self::S5 => Ok(format!(
+                "{}",
+                u64::from_be_bytes([0, 0, 0, data[0], data[1], data[2], data[3], data[4]])
+            )),
             v => unimplemented!("unsupported codec {v:?}"),
         }
     }
@@ -871,14 +1124,14 @@ impl<'a> TryFrom<&'a str> for ColumnType {
         match value {
             "integer" => Ok(Self::Integer),
             "text" => Ok(Self::Text),
-            v => bail!("unsupport column type {v}"),
+            v => bail!("unsupported column type \"{v}\""),
         }
     }
 }
 
 fn parse_sql_colomn_names(sql: &str) -> Result<Vec<ColumnInfo>> {
     if !sql.starts_with("CREATE TABLE") {
-        bail!("unsupported sql statement")
+        bail!("unsupported sql statement: \"{sql}\"")
     }
 
     let p1 = sql.find('(').context("'(' not found in sql")?;
@@ -888,10 +1141,24 @@ fn parse_sql_colomn_names(sql: &str) -> Result<Vec<ColumnInfo>> {
         .split(",")
         .enumerate()
         .map(|(idx, x)| {
-            let mut it = x.trim().split(" ").take(2);
-            let name = it.next().unwrap().to_string();
-            let ty = ColumnType::try_from(it.next().unwrap()).unwrap();
-            ColumnInfo { name, idx, ty }
+            let x = x.trim();
+            if x.starts_with('"') {
+                let col_name_end_pos = x.chars().skip(1).position(|x| x == '"').unwrap() + 1;
+                let name = x[1..col_name_end_pos].to_string();
+                let ty = x[col_name_end_pos + 2..]
+                    .split_once(' ')
+                    .map_or_else(|| Some(&x[col_name_end_pos + 2..]), |x| Some(x.0))
+                    .context("invalid col")
+                    .and_then(|x| ColumnType::try_from(x).context("invalid column type"))
+                    .unwrap(); // ;
+                ColumnInfo { name, idx, ty }
+            } else {
+                // Support column name with space and quoted: "size range" text.
+                let mut it = x.split(" ").take(2);
+                let name = it.next().unwrap().to_string();
+                let ty = ColumnType::try_from(it.next().unwrap()).unwrap();
+                ColumnInfo { name, idx, ty }
+            }
         })
         .collect();
     Ok(rows)
@@ -1020,7 +1287,7 @@ fn main() -> Result<()> {
                         .find(|x| x.name.as_str() == column_name)
                         .with_context(|| {
                             format!(
-                                "column \"{}\"not found in schema {}",
+                                "column \"{}\" not found in schema \"{}\"",
                                 column_name, table_schema.sql
                             )
                         })?;

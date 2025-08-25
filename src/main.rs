@@ -923,13 +923,14 @@ fn main() -> Result<()> {
                     parse_sql_colomn_names(table_schema.sql.as_str()).unwrap()
                 );
                 for record in table.cells.iter() {
+                    let row_id = &record.row_id.decoded().context("invalid row_id")?;
                     let id_type = &record.headers[0].codec().context("invalid id type")?;
                     let id = &record.payload[0];
                     let name_type = &record.headers[1].codec().context("invalid name type")?;
                     let name = String::from_utf8(record.payload[1].clone()).unwrap();
                     let color_type = &record.headers[2].codec().context("invalid color type")?;
                     let color = String::from_utf8(record.payload[2].clone()).unwrap();
-                    println!("id={id:?}({id_type:?}), name={name}({name_type:?}), color={color}({color_type:?})");
+                    println!("row_id={row_id}, id={id:?}({id_type:?}), name={name}({name_type:?}), color={color}({color_type:?})");
                 }
                 return Ok(());
             }

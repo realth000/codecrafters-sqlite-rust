@@ -348,7 +348,12 @@ impl Table {
     /// Get all data in one column specified by column id.
     ///
     /// Note that the data in column is converted to String.
-    pub fn get_columns(&self, cols: &[&ColumnInfo]) -> Result<Vec<String>> {
+    pub fn get_columns(
+        &self,
+        selected_cols: &[&ColumnInfo],
+        cols: &[ColumnInfo],
+        where_clause: Option<WhereClause>,
+    ) -> Result<Vec<String>> {
         if self.cells.is_empty() {
             return Ok(vec![]);
         }
@@ -367,11 +372,37 @@ impl Table {
             String::from_utf8(data.to_owned()).unwrap()
         }
 
+        // Find the info about the column in `WHERE` clause.
+        let wh = if let Some(wh) = &where_clause {
+            match cols.iter().position(|x| x.name == wh.col_name) {
+                Some(pos) => Some((pos, wh.col_value)),
+                None => bail!(
+                    "column \"{}\" in where clause not found in table",
+                    wh.col_name
+                ),
+            }
+        } else {
+            None
+        };
+
         let mut data = vec![];
 
         for cell in self.cells.iter() {
             let mut row_result = vec![];
-            for col in cols {
+
+            // If we have a `WHERE` clause, check the current cell's column value hits the value
+            // in `WHERE` clause or not, skip current cell if not.
+            if let Some(wh) = wh {
+                let wh_target = match cols[wh.0].ty {
+                    ColumnType::Integer => from_number(&cell.payload[wh.0]),
+                    ColumnType::Text => from_text(&cell.payload[wh.0]),
+                };
+                if wh_target != wh.1 {
+                    continue;
+                }
+            }
+
+            for col in selected_cols {
                 let d = match col.ty {
                     ColumnType::Integer => from_number(&cell.payload[col.idx]),
                     ColumnType::Text => from_text(&cell.payload[col.idx]),
@@ -694,7 +725,13 @@ pub struct ColumnInfo {
 }
 
 #[derive(Debug, Clone)]
-enum ColumnType {
+pub struct WhereClause<'a> {
+    pub col_name: &'a str,
+    pub col_value: &'a str,
+}
+
+#[derive(Debug, Clone)]
+pub enum ColumnType {
     Integer,
     Text,
 }
@@ -783,7 +820,8 @@ fn main() -> Result<()> {
     let command = &args[2];
 
     let select_column_re =
-        Regex::new(r#"(SELECT|select) (?<columns>[\w ,]+) (FROM|from) (?<table>\w+)$"#).unwrap();
+        Regex::new(r#"(SELECT|select) (?<columns>[\w ,]+) (FROM|from) (?<table>\w+)( ((WHERE|where) (?<col_name>\w+) ?= ?'(?<col_val>.+)'))?$"#)
+            .unwrap();
 
     match command.as_str() {
         ".dbinfo" => {
@@ -831,6 +869,17 @@ fn main() -> Result<()> {
                     .map(|x| x.trim().to_string())
                     .collect::<Vec<_>>();
                 let table_name = cap.name("table").unwrap().as_str();
+                let col_name = cap.name("col_name").map(|x| x.as_str());
+                let col_value = cap.name("col_val").map(|x| x.as_str());
+                let where_clause = if let (Some(col_name), Some(col_value)) = (col_name, col_value)
+                {
+                    Some(WhereClause {
+                        col_name,
+                        col_value,
+                    })
+                } else {
+                    None
+                };
 
                 let table = load_table_from_file(&file_path, table_name)?;
                 let schema = load_schema_from_file(&file_path)?;
@@ -850,8 +899,14 @@ fn main() -> Result<()> {
 
                     column_idx.push(col_info);
                 }
-                let column_datas = table.get_columns(column_idx.as_slice())?;
-                println!("{}", column_datas.join("\n"));
+                let column_datas = table.get_columns(
+                    column_idx.as_slice(),
+                    sql_columns.as_slice(),
+                    where_clause,
+                )?;
+                if !column_datas.is_empty() {
+                    println!("{}", column_datas.join("\n"));
+                }
                 return Ok(());
             }
 

@@ -92,7 +92,7 @@ struct BTreePageHeader {
 
 impl BTreePageHeader {
     pub fn from_cursor(cursor: &mut Cursor<&'_ [u8]>) -> Result<Self> {
-        let page_type = BTreePageType::try_from(cursor.get_u8()).context("invalid b-tree type")?;
+        let page_type = BTreePageType::try_from(cursor.get_u8()).context("invalid B-tree type")?;
         let free_block_offset = cursor.get_u16();
         let cells_count = cursor.get_u16();
 
@@ -250,7 +250,8 @@ impl SchemaTable {
         for pos in cells_offsets.iter() {
             cursor.set_position(*pos as u64);
             // Parse record, the schema of schema table info.
-            let record = Record::from_cursor(cursor).context("failed to parse page cell")?;
+            let record =
+                TableLeafRecord::from_cursor(cursor).context("failed to parse page cell")?;
             if record.headers.len() != 5 {
                 bail!(
                     "expected 5 columns in schema table, only got {}",
@@ -289,6 +290,92 @@ impl SchemaTable {
     }
 }
 
+/// B-tree in sqlite3.
+#[derive(Debug, Clone)]
+pub struct BTreePage {
+    /// Page header.
+    header: BTreePageHeader,
+
+    /// Body data in the page.
+    cells: Cells,
+}
+
+impl BTreePage {
+    pub fn from_cursor(cursor: &mut Cursor<&'_ [u8]>) -> Result<Self> {
+        let initial_pos = cursor.position();
+        let header = BTreePageHeader::from_cursor(cursor).context("failed to build page header")?;
+        let cells =
+            Cells::new(cursor, &header, initial_pos).context("failed to build B-tree page")?;
+        Ok(Self { header, cells })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum Cells {
+    TableLeaf(Vec<TableLeafRecord>),
+    TableInterior(Vec<TableInteriorRecord>),
+}
+
+impl Cells {
+    /// Build a list of `Cells` from `cursor` with info provided by `page_header`.
+    ///
+    /// `initial_pos` is the offset of begining of current page (before parsing page header).
+    fn new(
+        cursor: &mut Cursor<&'_ [u8]>,
+        page_header: &BTreePageHeader,
+        initial_pos: u64,
+    ) -> Result<Self> {
+        match page_header.page_type {
+            BTreePageType::InteriorIndex => todo!(),
+            BTreePageType::InteriorTable => {
+                let mut cells_offsets = vec![];
+                let cells_count = page_header.cells_count;
+                for _ in 0..cells_count {
+                    cells_offsets.push(cursor.get_u16());
+                }
+
+                let mut cells = vec![];
+                for pos in cells_offsets.iter() {
+                    let cell_pos = initial_pos + (*pos as u64);
+                    cursor.set_position(cell_pos);
+                    // Parse record, the schema of schema table info.
+                    let record = TableInteriorRecord::from_cursor(cursor).with_context(|| {
+                        format!("failed to build table interior record at 0x{cell_pos:0>8x}")
+                    })?;
+                    cells.push(record);
+                }
+
+                Ok(Self::TableInterior(cells))
+            }
+            BTreePageType::LeafIndex => todo!(),
+            BTreePageType::LeafTable => {
+                let mut cells_offsets = vec![];
+                let cells_count = page_header.cells_count;
+                for _ in 0..cells_count {
+                    cells_offsets.push(cursor.get_u16());
+                }
+                // Should NOT sort cells here, because the order of elements in cells_offset array is the same with
+                // items in table, that is, the nth element in cells_offset locates the nth row in table, sorting
+                // cells_offsets array loses the row order in table. Though cells data are not saved in the same order,
+                // it's fine because we are relocating the cursor with the obsolute position.
+                // cells_offsets.sort();
+
+                let mut cells = vec![];
+                for pos in cells_offsets.iter() {
+                    let cell_pos = initial_pos + (*pos as u64);
+                    cursor.set_position(cell_pos);
+                    // Parse record, the schema of schema table info.
+                    let record = TableLeafRecord::from_cursor(cursor)
+                        .context("failed to parse page cell")?;
+                    cells.push(record);
+                }
+
+                Ok(Self::TableLeaf(cells))
+            }
+        }
+    }
+}
+
 /// Table data in database.
 ///
 /// This type is NOT the schema of table in `SchemaTable`.
@@ -300,49 +387,54 @@ impl SchemaTable {
 /// a single page.
 #[derive(Debug, Clone)]
 pub struct Table {
-    /// Page header.
-    page_header: BTreePageHeader,
-
-    /// All cells offset.
-    cells_offsets: Vec<u16>,
-
     /// Table data.
     ///
     /// Offset of nth table is saved as the nth element in `cells_offsets`.
-    cells: Vec<Record>,
+    cells: Vec<TableLeafRecord>,
 }
 
 impl Table {
-    pub fn from_cursor(cursor: &mut Cursor<&'_ [u8]>) -> Result<Self> {
-        let table_start_pos = cursor.position();
-        let page_header =
-            BTreePageHeader::from_cursor(cursor).context("failed to parse page_header")?;
+    pub fn from_cursor(cursor: &mut Cursor<&'_ [u8]>, page_size: u32) -> Result<Self> {
+        let page = BTreePage::from_cursor(cursor).context("failed to build B-tree page")?;
 
-        let mut cells_offsets = vec![];
-        let cells_count = page_header.cells_count;
-        for _ in 0..cells_count {
-            cells_offsets.push(cursor.get_u16());
-        }
-        // Should NOT sort cells here, because the order of elements in cells_offset array is the same with
-        // items in table, that is, the nth element in cells_offset locates the nth row in table, sorting
-        // cells_offsets array loses the row order in table. Though cells data are not saved in the same order,
-        // it's fine because we are relocating the cursor with the obsolute position.
-        // cells_offsets.sort();
-
-        let mut cells = vec![];
-        for pos in cells_offsets.iter() {
-            let cell_pos = table_start_pos + (*pos as u64);
-            cursor.set_position(cell_pos);
-            // Parse record, the schema of schema table info.
-            let record = Record::from_cursor(cursor).context("failed to parse page cell")?;
-            cells.push(record);
+        fn load_page(
+            cursor: &Cursor<&'_ [u8]>,
+            page_idx: u32,
+            page_size: u32,
+        ) -> Result<BTreePage> {
+            let mut cursor = cursor.clone();
+            let table_start_pos = (page_size as u64) * (page_idx as u64 - 1);
+            cursor.set_position(table_start_pos);
+            BTreePage::from_cursor(&mut cursor).with_context(|| {
+                format!(
+                    "failed to load B-tree page id={page_idx} at offset=0x{table_start_pos:0>8x}"
+                )
+            })
         }
 
-        Ok(Self {
-            page_header,
-            cells_offsets,
-            cells,
-        })
+        fn traverse_page(
+            cursor: &Cursor<&'_ [u8]>,
+            page: BTreePage,
+            page_size: u32,
+        ) -> Result<Vec<TableLeafRecord>> {
+            match page.cells {
+                Cells::TableLeaf(v) => Ok(v),
+                Cells::TableInterior(v) => {
+                    let mut records = vec![];
+                    for page in v.into_iter() {
+                        let p = load_page(cursor, page.next_page, page_size)
+                            .context("failed to load page")?;
+                        let mut records_in_page = traverse_page(cursor, p, page_size)?;
+                        records.append(&mut records_in_page);
+                    }
+                    Ok(records)
+                }
+            }
+        }
+
+        let cells = traverse_page(&cursor, page, page_size).context("failed to traverse page")?;
+
+        Ok(Self { cells })
     }
 
     /// Get all data in one column specified by column id.
@@ -407,7 +499,13 @@ impl Table {
                     ColumnType::Integer => from_number(&cell.payload[col.idx]),
                     ColumnType::Text => from_text(&cell.payload[col.idx]),
                 };
-                row_result.push(d);
+                // A zero id means autoincrement.
+                // We should handle AUTOINCREMENT fields more carefully, but it's fine.
+                if col.name == "id" && d == "0" {
+                    row_result.push(cell.row_id.encoded_value.to_string());
+                } else {
+                    row_result.push(d);
+                }
             }
             data.push(row_result.join("|"));
         }
@@ -416,9 +514,9 @@ impl Table {
     }
 }
 
-/// Record in cell, carryig data.
+/// Record in cell, carryig data, for table B-tree page that is a leaf page.
 ///
-/// Record contains header and payload where header is `varint`s and payload is `Vec<u8>`s.
+/// Contains header and payload where header is `varint`s and payload is `Vec<u8>`s.
 ///
 /// Each record holds a row of data in the table, stores in `payload` field.
 ///
@@ -454,7 +552,7 @@ impl Table {
 /// ...
 /// ```
 #[derive(Debug, Clone)]
-pub struct Record {
+pub struct TableLeafRecord {
     /// Cell length, totally.
     ///
     /// The value represents bytes count of current `Cell`, including `length` field itself.
@@ -481,7 +579,7 @@ pub struct Record {
     payload: Vec<Vec<u8>>,
 }
 
-impl Record {
+impl TableLeafRecord {
     pub fn from_cursor(cursor: &mut Cursor<&'_ [u8]>) -> Result<Self> {
         if !cursor.has_remaining() {
             panic!("cursor ended");
@@ -543,6 +641,36 @@ impl Record {
             headers,
             payload,
         })
+    }
+}
+
+/// Record for table interior page.
+///
+/// Carries no table data but the page id of more B-tree pages for current table.
+/// The carrying may be recursive, means interior record points to more interior pages
+/// and after more pointing rounds there are leafe pages that carries data.
+#[derive(Debug, Clone)]
+pub struct TableInteriorRecord {
+    /// Page id of next page.
+    ///
+    /// A 4-byte big-endian page number which is the left child pointer.
+    next_page: u32,
+
+    /// Row id.
+    row_id: Varint,
+}
+
+impl TableInteriorRecord {
+    pub fn from_cursor(cursor: &mut Cursor<&'_ [u8]>) -> Result<Self> {
+        if !cursor.has_remaining() {
+            bail!("no data left for table iterior record")
+        }
+
+        let next_page = cursor.get_u32();
+        let row_id = Varint::from_cursor(cursor)
+            .context("failed to build row_id of table interior record")?;
+
+        Ok(Self { next_page, row_id })
     }
 }
 
@@ -800,7 +928,7 @@ fn load_table_from_file(file_path: &str, table_name: &str) -> Result<Table> {
         .seek_relative(offset as i64)
         .context("failed to find table postion")?;
 
-    let table = Table::from_cursor(&mut cursor)
+    let table = Table::from_cursor(&mut cursor, page_size)
         .with_context(|| format!("failed to parse table {}", table_name))?;
 
     Ok(table)
